@@ -1,6 +1,6 @@
 # Windows Remote UAC Runner
 
-This helper script deploys UAC to a remote Unix-like endpoint, mounts remote storage on the target, runs UAC with the mount as the output directory, and then unmounts the storage.
+A small Windows helper script for deploying UAC to a remote Unix-like host, mounting remote storage, running UAC on the remote host, and unmounting the storage when finished.
 
 ## File
 
@@ -11,47 +11,114 @@ This helper script deploys UAC to a remote Unix-like endpoint, mounts remote sto
 - Windows with Python 3.8+ installed.
 - `ssh` and `scp` available on Windows (OpenSSH client in PATH).
 - Remote endpoint reachable by SSH.
-- Remote endpoint capable of mounting the specified storage source and writing output to the mount point.
+- Remote endpoint able to mount the requested storage source and write output to the mount point.
 
-## Usage
+## Basic usage
+
+The recommended way to run this script is with a configuration file. All required options can be defined in the file, and the command line only needs to pass `--config`.
 
 ```powershell
-python windows_run_remote_uac.py \
-  --remote-host 10.0.0.1 \
-  --remote-user root \
-  --mount-source //fileserver/share_5g7b2 \
-  --mount-point /mnt/4g7k9 \
-  --mount-fstype cifs \
-  --mount-options "username=root,password=Aa123456,uid=0" \
-  --local-uac-path C:\workspaces\uac \
-  --cleanup \
-  --verbose -- --profile ir_triage
+python windows_run_remote_uac.py --config windows_run_remote_uac.example.ini
 ```
 
-### Key options
+The script also supports command-line overrides when needed, but that is optional.
 
+## Configuration file support
+
+The script supports loading defaults from a configuration file. Values provided on the command line always override values from the config file.
+
+Supported formats:
+
+- JSON
+- INI
+
+### Example INI config
+
+```ini
+[uac]
+remote_host = 10.0.0.1
+remote_user = root
+remote_port = 22
+ssh_options = StrictHostKeyChecking=no,UserKnownHostsFile=/dev/null
+local_uac_path = C:\workspaces\uac
+remote_temp_root = /tmp/uac_remote
+mount_source = //fileserver/share_5g7b2
+mount_point = /mnt/output
+mount_fstype = cifs
+mount_options = username=root,password=Aa123456,uid=0
+use_sudo = false
+cleanup = true
+verbose = true
+no_umount_on_error = false
+uac_args = --profile ir_triage
+```
+
+### Example JSON config
+
+```json
+{
+  "remote_host": "10.0.0.1",
+  "remote_user": "root",
+  "remote_port": 22,
+  "ssh_options": ["StrictHostKeyChecking=no", "UserKnownHostsFile=/dev/null"],
+  "local_uac_path": "C:\\workspaces\\uac",
+  "remote_temp_root": "/tmp/uac_remote",
+  "mount_source": "//fileserver/share_5g7b2",
+  "mount_point": "/mnt/output",
+  "mount_fstype": "cifs",
+  "mount_options": "username=root,password=Aa123456,uid=0",
+  "use_sudo": false,
+  "cleanup": true,
+  "verbose": true,
+  "no_umount_on_error": false,
+  "uac_args": ["--profile", "ir_triage"]
+}
+```
+
+### Run with a config file
+
+```powershell
+python windows_run_remote_uac.py --config windows_run_remote_uac.example.ini
+```
+
+### Run with config plus command-line override
+
+```powershell
+python windows_run_remote_uac.py --config windows_run_remote_uac.example.ini --mount-source //override/share --verbose -- --profile ir_triage
+```
+
+## Command-line options
+
+- `--config` — Path to a JSON or INI configuration file.
 - `--remote-host` — Remote SSH host or IP address.
-- `--remote-user` — SSH username on the remote endpoint. The script will prompt for the SSH password if password authentication is enabled.
-- `--mount-source` — Remote mount source, such as a network share or block device. Use a random 5-character alphanumeric name for the share/mount identifier if desired.
-- `--mount-point` — Remote directory where the mount is created. Use a random 5-character alphanumeric suffix for a temporary mount point.
-- `--mount-point` — Remote directory where the mount is created.
-- `--mount-fstype` — Filesystem type for `mount`.
-- `--mount-options` — Mount options to pass to the remote `mount` command.
+- `--remote-user` — Remote SSH username.
+- `--remote-port` — Remote SSH port.
+- `--ssh-option` — Additional SSH option to pass to `ssh` and `scp`.
 - `--local-uac-path` — Local path to the extracted UAC directory.
-- `--cleanup` — Remove the temporary remote UAC copy after execution.
-- `--verbose` — Print progress and command information.
-- `--` — All following arguments are passed directly to the remote `uac` invocation.
+- `--remote-temp-root` — Remote base directory for the temporary UAC deployment.
+- `--remote-temp-name` — Optional remote temporary directory name.
+- `--mount-source` — Remote mount source (network share, device, path).
+- `--mount-point` — Remote mount target directory.
+- `--mount-fstype` — Filesystem type for the remote mount.
+- `--mount-options` — Options for the remote mount command.
+- `--mount-command` — Custom mount command to run instead of the default `mount` invocation.
+- `--use-sudo` — Use `sudo` for remote mount and unmount operations.
+- `--cleanup` — Remove the temporary remote UAC directory after execution.
+- `--verbose` — Print verbose progress and commands.
+- `--no-umount-on-error` — Skip unmount on remote UAC execution failure.
+- `--uac-args` — Remaining arguments to pass through to the remote UAC invocation.
 
 ## Behavior
 
-1. Copies the local UAC directory to a temporary remote directory.
-2. Mounts the specified remote storage on the remote endpoint.
-3. Executes UAC with the remote mount point as the destination.
-4. Unmounts the storage after UAC finishes.
-5. Optionally cleans up the remote temporary copy.
+1. Copy the local UAC directory to a generated remote temporary directory.
+2. Mount the configured remote storage on the remote endpoint.
+3. Run the remote `uac` binary with the mount point as the output destination.
+4. Unmount the storage when UAC completes.
+5. Optionally clean up the temporary remote UAC directory.
 
 ## Notes
 
-- The helper assumes the remote host has the standard `mount` and `umount` commands available.
-- If you need a custom mount command, use `--mount-command`.
-- If the remote command requires elevated permissions, add `--use-sudo`.
+- The remote host must provide `mount` and `umount`.
+- Use `--mount-command` when a custom mount invocation is required.
+- Use `--use-sudo` when mount/unmount requires elevated privileges.
+- `ssh_options` may be set as a comma-separated string in INI or as a list in JSON.

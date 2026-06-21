@@ -15,6 +15,8 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import configparser
+import json
 import os
 import shlex
 import subprocess
@@ -72,6 +74,120 @@ def quote_remote(path: str) -> str:
     return shlex.quote(path)
 
 
+def parse_config_file(config_file):
+    config_path = Path(config_file).expanduser()
+    if not config_path.is_file():
+        raise RuntimeError(f"Configuration file does not exist: {config_file}")
+
+    suffix = config_path.suffix.lower()
+    if suffix == ".json":
+        with config_path.open("r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    else:
+        text = config_path.read_text(encoding="utf-8").lstrip()
+        if text.startswith("{"):
+            config = json.loads(text)
+        else:
+            parser = configparser.ConfigParser()
+            parser.read(config_path)
+            if parser.sections():
+                section_name = "uac" if "uac" in parser else parser.sections()[0]
+                section = parser[section_name]
+            else:
+                section = parser.defaults()
+            config = dict(section.items())
+
+    if not isinstance(config, dict):
+        raise RuntimeError("Configuration file must contain a mapping of keys to values.")
+
+    return normalize_config_values(config)
+
+
+def parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "yes", "1", "on"}:
+        return True
+    if text in {"false", "no", "0", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value}")
+
+
+def normalize_config_values(config):
+    normalized = {}
+    for key, value in config.items():
+        key = key.replace("-", "_")
+        if key in {"use_sudo", "cleanup", "verbose", "no_umount_on_error"}:
+            normalized[key] = parse_bool(value)
+            continue
+        if key == "remote_port":
+            if value is None or value == "":
+                continue
+            normalized[key] = int(value)
+            continue
+        if key == "ssh_options":
+            if isinstance(value, str):
+                normalized[key] = [item.strip() for item in value.split(",") if item.strip()]
+            elif isinstance(value, (list, tuple)):
+                normalized[key] = [str(item).strip() for item in value if str(item).strip()]
+            else:
+                raise ValueError("ssh_options must be a string or list")
+            continue
+        if key == "uac_args":
+            if isinstance(value, str):
+                normalized[key] = shlex.split(value)
+            elif isinstance(value, (list, tuple)):
+                normalized[key] = [str(item) for item in value]
+            else:
+                raise ValueError("uac_args must be a string or list")
+            continue
+        normalized[key] = value
+    return normalized
+
+
+def validate_required_args(args):
+    missing = []
+    for name in ("remote_host", "remote_user", "mount_source", "mount_point"):
+        if not getattr(args, name, None):
+            missing.append(name.replace("_", "-"))
+    if missing:
+        raise RuntimeError(
+            "Missing required arguments: {}. Provide them via --config or on the command line.".format(
+                ", ".join(missing)
+            )
+        )
+
+
+def create_parser(defaults=None):
+    defaults = defaults or {}
+    parser = argparse.ArgumentParser(
+        description="Deploy UAC to a remote endpoint, mount output storage, execute UAC, and unmount.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument("--config", help="Path to a JSON or INI configuration file")
+    parser.add_argument("--remote-host", default=defaults.get("remote_host"), help="Remote endpoint hostname or IP")
+    parser.add_argument("--remote-user", default=defaults.get("remote_user"), help="Remote SSH user")
+    parser.add_argument("--remote-port", type=int, default=defaults.get("remote_port"), help="SSH port")
+    parser.add_argument("--ssh-option", action="append", dest="ssh_options", default=defaults.get("ssh_options", []), help="Additional SSH option to pass to ssh/scp")
+    parser.add_argument("--local-uac-path", type=Path, default=Path(defaults.get("local_uac_path")) if defaults.get("local_uac_path") else Path.cwd(), help="Local path to the extracted UAC directory")
+    parser.add_argument("--remote-temp-root", default=defaults.get("remote_temp_root", "/tmp/uac_remote"), help="Remote root directory to copy UAC into")
+    parser.add_argument("--remote-temp-name", default=defaults.get("remote_temp_name"), help="Remote temporary directory name, auto-generated if omitted")
+    parser.add_argument("--mount-source", default=defaults.get("mount_source"), help="Remote mount source (share path, device, or network storage source)")
+    parser.add_argument("--mount-point", default=defaults.get("mount_point"), help="Remote mount point where UAC output will be written")
+    parser.add_argument("--mount-fstype", default=defaults.get("mount_fstype", "auto"), help="Filesystem type for the remote mount")
+    parser.add_argument("--mount-options", default=defaults.get("mount_options", ""), help="Mount options for the remote mount")
+    parser.add_argument("--mount-command", default=defaults.get("mount_command"), help="Custom remote mount command to use instead of the default mount invocation")
+    parser.add_argument("--use-sudo", action="store_true", default=defaults.get("use_sudo", False), help="Use sudo for remote mount and unmount commands")
+    parser.add_argument("--cleanup", action="store_true", default=defaults.get("cleanup", False), help="Remove the remote temporary UAC directory after execution")
+    parser.add_argument("--verbose", action="store_true", default=defaults.get("verbose", False), help="Print verbose progress information")
+    parser.add_argument("--no-umount-on-error", action="store_true", default=defaults.get("no_umount_on_error", False), help="Do not attempt to unmount if UAC execution fails")
+    parser.add_argument("--uac-args", nargs=argparse.REMAINDER, help="Arguments to pass to the remote UAC invocation; specify after '--'", default=defaults.get("uac_args", []))
+
+    return parser
+
+
 def remote_execute(args, remote_command, capture_output=False):
     command = build_ssh_command(args, remote_command)
     if args.verbose:
@@ -120,32 +236,21 @@ def validate_local_uac_path(local_uac_path: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Deploy UAC to a remote endpoint, mount output storage, execute UAC, and unmount.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    # Load config-only args first so we can use file values as defaults.
+    initial_parser = argparse.ArgumentParser(add_help=False)
+    initial_parser.add_argument("--config", help="Path to a JSON or INI configuration file")
+    initial_args, remaining = initial_parser.parse_known_args()
 
-    parser.add_argument("--remote-host", required=True, help="Remote endpoint hostname or IP")
-    parser.add_argument("--remote-user", required=True, help="Remote SSH user")
-    parser.add_argument("--remote-port", type=int, help="SSH port")
-    parser.add_argument("--ssh-option", action="append", dest="ssh_options", default=[], help="Additional SSH option to pass to ssh/scp")
-    parser.add_argument("--local-uac-path", type=Path, default=Path.cwd(), help="Local path to the extracted UAC directory")
-    parser.add_argument("--remote-temp-root", default="/tmp/uac_remote", help="Remote root directory to copy UAC into")
-    parser.add_argument("--remote-temp-name", default=None, help="Remote temporary directory name, auto-generated if omitted")
-    parser.add_argument("--mount-source", required=True, help="Remote mount source (share path, device, or network storage source)")
-    parser.add_argument("--mount-point", required=True, help="Remote mount point where UAC output will be written")
-    parser.add_argument("--mount-fstype", default="auto", help="Filesystem type for the remote mount")
-    parser.add_argument("--mount-options", default="", help="Mount options for the remote mount")
-    parser.add_argument("--mount-command", help="Custom remote mount command to use instead of the default mount invocation")
-    parser.add_argument("--use-sudo", action="store_true", help="Use sudo for remote mount and unmount commands")
-    parser.add_argument("--cleanup", action="store_true", help="Remove the remote temporary UAC directory after execution")
-    parser.add_argument("--verbose", action="store_true", help="Print verbose progress information")
-    parser.add_argument("--no-umount-on-error", action="store_true", help="Do not attempt to unmount if UAC execution fails")
-    parser.add_argument("--uac-args", nargs=argparse.REMAINDER, help="Arguments to pass to the remote UAC invocation; specify after '--'", default=[])
+    config_defaults = {}
+    if initial_args.config:
+        config_defaults = parse_config_file(initial_args.config)
 
-    parsed = parser.parse_args()
+    parser = create_parser(config_defaults)
+    parsed = parser.parse_args(remaining, namespace=initial_args)
     if parsed.uac_args and parsed.uac_args[0] == "--":
         parsed.uac_args = parsed.uac_args[1:]
+
+    validate_required_args(parsed)
     return parsed
 
 
